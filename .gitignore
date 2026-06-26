@@ -7,3 +7,6 @@ venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Generated test fixtures (rebuilt by tests/generate_fixtures.py)
+tests/fixtures/

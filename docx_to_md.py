@@ -5,12 +5,18 @@ Preserves bold, italic, strikethrough, inline code, headings, bulleted and
 numbered lists (including nesting), hyperlinks, images, and tables. Tables with
 merged or nested cells fall back to raw HTML (which Markdown permits).
 
+Text in a monospace font is rendered as inline `code`, but only as a heuristic:
+for a document that is *predominantly* monospace (a log or terminal dump), that
+signal is meaningless, so it is disabled automatically and bold/italic render
+normally. Use --code-detection to force the behaviour either way.
+
 Footnotes, comments, and tracked-change marks are dropped; the final accepted
 text is kept (insertions are accepted, deletions removed).
 
 Usage:
     python docx_to_md.py input.docx -o output.md
     python docx_to_md.py input.docx --html-tables --verbose
+    python docx_to_md.py input.docx --code-detection off
     python docx_to_md.py input.docx --engine mammoth
 
 See README.md for the full feature list and known limitations.
@@ -112,7 +118,7 @@ class Converter:
     """Walks a python-docx Document and emits Markdown."""
 
     def __init__(self, docx_path, output_path, images_dir="images",
-                 force_html_tables=False, verbose=False):
+                 force_html_tables=False, code_detection="auto", verbose=False):
         self.document = Document(docx_path)
         self.output_dir = os.path.dirname(os.path.abspath(output_path))
         if os.path.isabs(images_dir):
@@ -120,12 +126,14 @@ class Converter:
         else:
             self.images_dir = os.path.join(self.output_dir, images_dir)
         self.force_html_tables = force_html_tables
+        self.code_detection = code_detection
         self.verbose = verbose
         self.warnings = []
         self._image_cache = {}   # rId -> relative path written into the markdown
         self._used_names = {}     # filename -> rId (collision tracking)
         self._num_fmt = {}        # numId(str) -> {ilvl(int): numFmt(str)}
         self._build_numbering_map()
+        self._code_enabled = self._resolve_code_detection()
 
     # ----- warnings ---------------------------------------------------------
 
@@ -317,17 +325,77 @@ class Converter:
             return True
         return val.lower() not in ("0", "false", "off", "none")
 
-    def _is_code(self, rPr):
+    # ----- code-span detection ---------------------------------------------
+
+    @staticmethod
+    def _font_of(rPr):
+        """Return the run's directly-set font name, or None if inherited."""
         if rPr is None:
-            return False
+            return None
         rfonts = rPr.find(qn("w:rFonts"))
         if rfonts is None:
-            return False
+            return None
         for attr in ("w:ascii", "w:hAnsi", "w:cs"):
             font = rfonts.get(qn(attr))
-            if font and font.lower() in MONOSPACE_FONTS:
-                return True
-        return False
+            if font:
+                return font
+        return None
+
+    def _default_font(self):
+        """Resolve the document's default body font (docDefaults, then Normal)."""
+        name = None
+        try:
+            styles_el = self.document.styles.element
+        except Exception:
+            return None
+        dd = styles_el.find(qn("w:docDefaults"))
+        if dd is not None:
+            rprd = dd.find(qn("w:rPrDefault"))
+            rpr = rprd.find(qn("w:rPr")) if rprd is not None else None
+            name = self._font_of(rpr) or name
+        try:
+            normal = self.document.styles["Normal"]
+            name = self._font_of(normal.element.find(qn("w:rPr"))) or name
+        except Exception:
+            pass
+        return name
+
+    def _resolve_code_detection(self):
+        """Decide whether monospace runs should become inline code.
+
+        ``on``/``off`` are explicit. ``auto`` keeps the heuristic on for normal
+        prose but turns it off when the document is *predominantly* monospace
+        (e.g. a terminal/log dump), where a monospace font signals nothing.
+        """
+        if self.code_detection == "on":
+            return True
+        if self.code_detection == "off":
+            return False
+
+        default = self._default_font()
+        default_mono = bool(default) and default.lower() in MONOSPACE_FONTS
+        mono = total = 0
+        for r in self.document.element.body.iter(qn("w:r")):
+            text = self._run_text(r)
+            if not text:
+                continue
+            total += len(text)
+            font = self._font_of(r.find(qn("w:rPr")))
+            is_mono = default_mono if font is None else font.lower() in MONOSPACE_FONTS
+            if is_mono:
+                mono += len(text)
+
+        dominant = default_mono if total == 0 else mono >= 0.5 * total
+        if dominant:
+            self.warn("monospace is the body font; inline-code detection "
+                      "disabled (use --code-detection on to force it)")
+        return not dominant
+
+    def _is_code(self, rPr):
+        if not self._code_enabled:
+            return False
+        font = self._font_of(rPr)
+        return font is not None and font.lower() in MONOSPACE_FONTS
 
     def _run_text(self, run_el):
         parts = []
@@ -581,13 +649,14 @@ class Converter:
 
 
 def docx_to_md(path, output_path, images_dir="images",
-               force_html_tables=False, verbose=False):
+               force_html_tables=False, code_detection="auto", verbose=False):
     """Convert *path* to Markdown using the custom python-docx engine.
 
     Returns (markdown_text, warnings).
     """
     converter = Converter(path, output_path, images_dir=images_dir,
-                          force_html_tables=force_html_tables, verbose=verbose)
+                          force_html_tables=force_html_tables,
+                          code_detection=code_detection, verbose=verbose)
     md = converter.convert()
     return md, converter.warnings
 
@@ -611,6 +680,11 @@ def main(argv=None):
                              "output file (default: images)")
     parser.add_argument("--html-tables", action="store_true",
                         help="render every table as HTML, not just merged ones")
+    parser.add_argument("--code-detection", choices=("auto", "on", "off"),
+                        default="auto",
+                        help="treat monospace-font text as inline code: 'auto' "
+                             "(default) disables it for all-monospace documents, "
+                             "'on' always, 'off' never")
     parser.add_argument("--engine", choices=("custom", "mammoth"),
                         default="custom",
                         help="conversion engine (default: custom)")
@@ -633,6 +707,7 @@ def main(argv=None):
             args.input, output_path,
             images_dir=args.images_dir,
             force_html_tables=args.html_tables,
+            code_detection=args.code_detection,
             verbose=args.verbose,
         )
 
