@@ -1,0 +1,9 @@
+# Virtual environments
+mdconvert/
+venv/
+.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
